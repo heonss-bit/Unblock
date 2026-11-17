@@ -96,6 +96,8 @@ pub struct App {
     admin: bool,
     autostart: bool,
     pending_auto: bool,
+    /// Запуск из автозапуска Windows: в первом кадре сворачиваем окно.
+    start_minimized: bool,
     strategies: Vec<String>,
     toast: Option<(String, Instant)>,
     down: bool,
@@ -128,6 +130,7 @@ impl App {
             admin: sys::is_admin(),
             autostart: sys::autostart_enabled(),
             pending_auto,
+            start_minimized: std::env::args().any(|a| a == "--autostart"),
             strategies: Vec::new(),
             toast: None,
             down: false,
@@ -813,6 +816,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shutdown();
+        }
+        if self.start_minimized {
+            self.start_minimized = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         self.poll();
 

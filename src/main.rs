@@ -13,9 +13,6 @@ mod zapret;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
-    // При автозапуске с Windows окно открывается свёрнутым.
-    let minimized = std::env::args().any(|a| a == "--autostart");
-
     // Иконка окна: готовые пиксели 64x64 RGBA, без декодирования картинок.
     let icon = egui::IconData {
         rgba: include_bytes!("../assets/icon64.rgba").to_vec(),
@@ -27,7 +24,6 @@ fn main() -> eframe::Result<()> {
             .with_title("Unblock")
             .with_inner_size([900.0, 600.0])
             .with_min_inner_size([780.0, 540.0])
-            .with_minimized(minimized)
             .with_icon(icon),
         ..Default::default()
     };
