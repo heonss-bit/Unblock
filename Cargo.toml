@@ -1,6 +1,6 @@
 [package]
 name = "unblock"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Минималистичное окно для запуска обхода блокировок: zapret и TG WS Proxy от Flowseal"
 license = "MIT"

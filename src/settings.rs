@@ -29,6 +29,22 @@ impl Mode {
             Mode::Discord => "Только Discord",
         }
     }
+
+    pub fn index(self) -> usize {
+        match self {
+            Mode::Both => 0,
+            Mode::Youtube => 1,
+            Mode::Discord => 2,
+        }
+    }
+
+    pub fn from_index(i: usize) -> Mode {
+        match i {
+            1 => Mode::Youtube,
+            2 => Mode::Discord,
+            _ => Mode::Both,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -39,6 +55,12 @@ pub struct Settings {
     pub secret: String,
     pub zapret_tag: String,
     pub tg_tag: String,
+    /// Тёмная тема (иначе светлая).
+    pub theme_dark: bool,
+    /// Номер цвета акцента из ui::ACCENTS.
+    pub accent: usize,
+    /// Включать запрет и TG-прокси сразу при запуске приложения.
+    pub auto_enable: bool,
 }
 
 impl Default for Settings {
@@ -49,6 +71,9 @@ impl Default for Settings {
             secret: String::new(),
             zapret_tag: String::new(),
             tg_tag: String::new(),
+            theme_dark: true,
+            accent: 0,
+            auto_enable: false,
         }
     }
 }

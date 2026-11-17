@@ -1,14 +1,15 @@
-//! Главное окно Unblock: слева «Запрет», справа «TG-прокси», внизу «Включить обе функции».
+//! Главное окно Unblock: слева колонка с разделами, справа страница выбранного раздела.
 
 use std::process::Child;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Ui, Vec2};
+use eframe::egui::{self, Align, Align2, Color32, Id, Layout, RichText, Ui, Vec2};
 
 use crate::settings::{Mode, Settings};
-use crate::{engines, sys, tgproxy, ui, zapret};
+use crate::ui::{self, Colors};
+use crate::{engines, sys, tgproxy, zapret};
 
 /// Сообщения из фоновых потоков в окно.
 enum Msg {
@@ -36,6 +37,15 @@ impl Run {
     fn is_off(self) -> bool {
         matches!(self, Run::Off)
     }
+
+    /// Для кнопки питания: 0 выключено, 1 запускается, 2 работает.
+    fn code(self) -> u8 {
+        match self {
+            Run::Off => 0,
+            Run::Starting(_) => 1,
+            Run::On => 2,
+        }
+    }
 }
 
 enum Engines {
@@ -48,9 +58,16 @@ enum Engines {
     Ready,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Zapret,
+    Tg,
+    Settings,
+}
+
 /// Действия пользователя. Окно только собирает их, а выполняются они после отрисовки.
 enum Act {
-    ToggleHint,
+    SetPage(Page),
     ToggleZapret,
     ToggleTg,
     ToggleAll,
@@ -61,19 +78,26 @@ enum Act {
     CopyLink,
     OpenTelegram,
     OpenLogs,
+    SetAutostart(bool),
+    SetAutoEnable(bool),
+    SetTheme(bool),
+    SetAccent(usize),
 }
 
 pub struct App {
     s: Settings,
+    c: Colors,
+    page: Page,
     z: Option<Child>,
     z_run: Run,
     t: Option<Child>,
     t_run: Run,
     engines: Engines,
     admin: bool,
+    autostart: bool,
+    pending_auto: bool,
     strategies: Vec<String>,
     toast: Option<(String, Instant)>,
-    hint: bool,
     down: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -81,24 +105,31 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        ui::apply(&cc.egui_ctx);
         let mut s = Settings::load();
         if !sys::valid_secret(&s.secret) {
             s.secret = sys::random_hex16();
             s.save();
         }
+        let c = Colors::new(s.theme_dark, s.accent);
+        ui::install_fonts(&cc.egui_ctx);
+        ui::apply(&cc.egui_ctx, &c);
+
         let (tx, rx) = channel();
+        let pending_auto = s.auto_enable;
         let mut app = App {
             s,
+            c,
+            page: Page::Zapret,
             z: None,
             z_run: Run::Off,
             t: None,
             t_run: Run::Off,
             engines: Engines::Ready,
             admin: sys::is_admin(),
+            autostart: sys::autostart_enabled(),
+            pending_auto,
             strategies: Vec::new(),
             toast: None,
-            hint: false,
             down: false,
             tx,
             rx,
@@ -297,7 +328,7 @@ impl App {
                 self.z = None;
                 self.z_run = Run::Off;
                 self.toast(format!(
-                    "Запрет остановился ({status}). Подробности в файле zapret.log: меню ••• → «Открыть папку с логами»."
+                    "Запрет остановился ({status}). Подробности в файле zapret.log: Настройки → «Открыть папку с логами»."
                 ));
             }
             Some(Ok(None)) => {
@@ -326,7 +357,7 @@ impl App {
 
     fn handle(&mut self, a: Act, ctx: &egui::Context) {
         match a {
-            Act::ToggleHint => self.hint = !self.hint,
+            Act::SetPage(p) => self.page = p,
             Act::ToggleZapret => {
                 if self.z_run.is_off() {
                     self.start_zapret();
@@ -381,6 +412,26 @@ impl App {
             }
             Act::OpenTelegram => sys::open_url(&tgproxy::link(&self.s.secret)),
             Act::OpenLogs => sys::open_folder(&engines::data_dir()),
+            Act::SetAutostart(on) => match sys::set_autostart(on) {
+                Ok(()) => self.autostart = on,
+                Err(e) => self.toast(e),
+            },
+            Act::SetAutoEnable(on) => {
+                self.s.auto_enable = on;
+                self.s.save();
+            }
+            Act::SetTheme(dark) => {
+                self.s.theme_dark = dark;
+                self.s.save();
+                self.c = Colors::new(self.s.theme_dark, self.s.accent);
+                ui::apply(ctx, &self.c);
+            }
+            Act::SetAccent(i) => {
+                self.s.accent = i;
+                self.s.save();
+                self.c = Colors::new(self.s.theme_dark, self.s.accent);
+                ui::apply(ctx, &self.c);
+            }
         }
     }
 
@@ -391,61 +442,108 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------ рисование
+    // ------------------------------------------------------------ боковая колонка
 
-    fn view(&self, ui: &mut Ui, act: &mut Option<Act>) {
-        // Заголовок: как Header в TVCleaner.
+    fn sidebar(&self, ui: &mut Ui, act: &mut Option<Act>) {
+        let c = &self.c;
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
+            ui::brand_mark(ui.painter(), rect, c);
             ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(RichText::new("Unblock").size(28.0).strong());
-                ui.label(ui::muted(
-                    "Обход блокировок для YouTube, Discord и Telegram",
-                ));
-            });
-            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                let color = if self.hint { ui::ACCENT } else { ui::MUTED };
-                let b = egui::Button::new(RichText::new("?").size(15.0).strong().color(color))
-                    .fill(ui::SURFACE)
-                    .rounding(50.0)
-                    .min_size(Vec2::splat(32.0));
-                if ui.add(b).clicked() {
-                    *act = Some(Act::ToggleHint);
-                }
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add_space(2.0);
+                ui.label(ui::bold("Unblock", 20.0, c.text));
+                ui.label(RichText::new("обход блокировок").size(12.0).color(c.muted));
             });
         });
+        ui.add_space(18.0);
 
-        if self.hint {
-            egui::Frame::none()
-                .fill(ui::tint(ui::ACCENT, 26))
-                .rounding(16.0)
-                .inner_margin(egui::Margin::same(14.0))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label(
-                        RichText::new(
-                            "«Запрет» помогает открывать YouTube и Discord. Три точки рядом с ним: выбор сервисов и стратегии. \
-                             «TG-прокси» ускоряет Telegram Desktop: включи его и нажми «Открыть в Telegram» один раз. \
-                             Если что-то не работает, попробуй другую стратегию. Нужны права администратора.",
-                        )
-                        .size(13.0),
-                    );
-                });
+        ui.spacing_mut().item_spacing.y = 6.0;
+        if ui::nav_item(
+            ui,
+            c,
+            Id::new("nav_zapret"),
+            ui::icon_shield,
+            "Запрет",
+            self.page == Page::Zapret,
+        ) {
+            *act = Some(Act::SetPage(Page::Zapret));
+        }
+        if ui::nav_item(
+            ui,
+            c,
+            Id::new("nav_tg"),
+            ui::icon_plane,
+            "TG-прокси",
+            self.page == Page::Tg,
+        ) {
+            *act = Some(Act::SetPage(Page::Tg));
+        }
+        if ui::nav_item(
+            ui,
+            c,
+            Id::new("nav_settings"),
+            ui::icon_gear,
+            "Настройки",
+            self.page == Page::Settings,
+        ) {
+            *act = Some(Act::SetPage(Page::Settings));
         }
 
+        // Внизу: общая кнопка и версия.
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.label(
+                RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION")))
+                    .size(12.0)
+                    .color(c.muted),
+            );
+            let ready = matches!(self.engines, Engines::Ready);
+            let both_active = !self.z_run.is_off() && !self.t_run.is_off();
+            let w = ui.available_width();
+            if both_active {
+                if ui::button(ui, c, "Выключить всё", false, true, w, 46.0) {
+                    *act = Some(Act::ToggleAll);
+                }
+            } else if ui::button(ui, c, "Включить всё", true, ready, w, 46.0) {
+                *act = Some(Act::ToggleAll);
+            }
+        });
+    }
+
+    // ------------------------------------------------------------ страницы
+
+    fn page(&self, ui: &mut Ui, act: &mut Option<Act>) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 14.0;
+                self.banners(ui, act);
+                match self.page {
+                    Page::Zapret => self.page_zapret(ui, act),
+                    Page::Tg => self.page_tg(ui, act),
+                    Page::Settings => self.page_settings(ui, act),
+                }
+            });
+    }
+
+    /// Предупреждения сверху: права администратора и загрузка движков.
+    fn banners(&self, ui: &mut Ui, act: &mut Option<Act>) {
+        let c = &self.c;
         if !self.admin {
-            ui::card(ui, |ui| {
-                ui::tag(ui, "ПРАВА АДМИНИСТРАТОРА", ui::WARN);
+            ui::card(ui, c, |ui| {
+                ui::pill(ui, c, "ПРАВА АДМИНИСТРАТОРА", c.warn);
                 ui.label(ui::muted(
+                    c,
                     "Запусти Unblock от имени администратора: без этого запрет не заработает.",
                 ));
             });
         }
-
         match &self.engines {
             Engines::Installing { label, done, total } => {
-                ui::card(ui, |ui| {
-                    ui.label(RichText::new("Скачиваю движки Flowseal").strong());
+                ui::card(ui, c, |ui| {
+                    ui.label(ui::bold("Скачиваю движки Flowseal", 16.0, c.text));
                     let mb = |b: u64| b as f64 / 1_048_576.0;
                     let line = if *total > 0 {
                         format!("{label}: {:.1} из {:.1} МБ", mb(*done), mb(*total))
@@ -454,7 +552,7 @@ impl App {
                     } else {
                         format!("{label}…")
                     };
-                    ui.label(ui::muted(&line));
+                    ui.label(ui::muted(c, &line));
                     let frac = if *total > 0 {
                         *done as f32 / *total as f32
                     } else {
@@ -462,143 +560,92 @@ impl App {
                     };
                     ui.add(
                         egui::ProgressBar::new(frac)
-                            .fill(ui::ACCENT)
+                            .fill(c.accent)
                             .desired_height(8.0)
                             .animate(*total == 0),
                     );
                 });
             }
             Engines::Failed(e) => {
-                ui::card(ui, |ui| {
-                    ui::tag(ui, "НЕ УДАЛОСЬ СКАЧАТЬ", ui::JUNK);
-                    ui.label(ui::muted(e));
-                    if ui::ghost(ui, "Повторить", true, 40.0) {
+                ui::card(ui, c, |ui| {
+                    ui::pill(ui, c, "НЕ УДАЛОСЬ СКАЧАТЬ", c.junk);
+                    ui.label(ui::muted(c, e));
+                    let w = ui.available_width();
+                    if ui::button(ui, c, "Повторить", false, true, w, 42.0) {
                         *act = Some(Act::Retry);
                     }
                 });
             }
             Engines::Ready => {}
         }
-
-        let ready = matches!(self.engines, Engines::Ready);
-
-        // Две колонки.
-        ui.columns(2, |cols| {
-            self.zapret_card(&mut cols[0], act, ready);
-            self.tg_card(&mut cols[1], act, ready);
-        });
-
-        // Кнопка снизу.
-        let both_active = !self.z_run.is_off() && !self.t_run.is_off();
-        if both_active {
-            if ui::ghost(ui, "Выключить обе функции", true, 52.0) {
-                *act = Some(Act::ToggleAll);
-            }
-        } else if ui::primary(ui, "Включить обе функции", ready, 52.0) {
-            *act = Some(Act::ToggleAll);
-        }
-
-        let dash = |s: &str| {
-            if s.is_empty() {
-                "—".to_string()
-            } else {
-                s.to_string()
-            }
-        };
-        ui.label(
-            RichText::new(format!(
-                "Движки Flowseal · zapret {} · tg-ws-proxy {}",
-                dash(&self.s.zapret_tag),
-                dash(&self.s.tg_tag)
-            ))
-            .size(12.0)
-            .color(ui::MUTED),
-        );
     }
 
-    fn zapret_card(&self, ui: &mut Ui, act: &mut Option<Act>, ready: bool) {
-        ui::card(ui, |ui| {
-            ui.set_min_height(206.0);
-            ui.horizontal(|ui| {
-                ui.set_min_height(30.0);
-                ui.label(RichText::new("Запрет").size(20.0).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    self.dots_menu(ui, act);
-                });
-            });
-            let (text, color) = status_of(self.z_run, ready);
-            ui::tag(ui, text, color);
-            ui.label(ui::muted(self.s.mode.label()));
-            let strategy = self.s.strategy.trim_end_matches(".bat").to_string();
-            ui.label(ui::muted(&format!("Стратегия: {strategy}")).size(13.0));
-            ui.add_space(8.0);
-            if self.z_run.is_off() {
-                if ui::primary(ui, "Включить", ready, 46.0) {
+    fn status_of(&self, run: Run, ready: bool) -> (&'static str, Color32) {
+        let c = &self.c;
+        match run {
+            Run::On => ("Работает", c.accent_fg),
+            Run::Starting(_) => ("Запускается…", c.warn),
+            Run::Off => {
+                if ready {
+                    ("Выключено", c.muted)
+                } else {
+                    ("Ждёт движок", c.warn)
+                }
+            }
+        }
+    }
+
+    fn page_zapret(&self, ui: &mut Ui, act: &mut Option<Act>) {
+        let c = &self.c;
+        let ready = matches!(self.engines, Engines::Ready);
+        ui::header(ui, c, "Запрет", "Открывает YouTube и Discord");
+
+        ui::card(ui, c, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(6.0);
+                if ui::power_button(ui, c, Id::new("power_zapret"), self.z_run.code(), ready) {
                     *act = Some(Act::ToggleZapret);
                 }
-            } else if ui::ghost(ui, "Выключить", true, 46.0) {
-                *act = Some(Act::ToggleZapret);
-            }
-        });
-    }
-
-    fn tg_card(&self, ui: &mut Ui, act: &mut Option<Act>, ready: bool) {
-        ui::card(ui, |ui| {
-            ui.set_min_height(206.0);
-            // Строка заголовка той же высоты, что и в левой карточке (там кнопка меню).
-            ui.horizontal(|ui| {
-                ui.set_min_height(30.0);
-                ui.label(RichText::new("TG-прокси").size(20.0).strong());
-            });
-            let (text, color) = status_of(self.t_run, ready);
-            ui::tag(ui, text, color);
-            ui.label(ui::muted("Для Telegram Desktop"));
-            ui.label(ui::muted(&format!("Адрес {}:{}", tgproxy::HOST, tgproxy::PORT)).size(13.0));
-            ui.add_space(8.0);
-            if self.t_run.is_off() {
-                if ui::primary(ui, "Включить", ready, 46.0) {
-                    *act = Some(Act::ToggleTg);
-                }
-            } else if ui::ghost(ui, "Выключить", true, 46.0) {
-                *act = Some(Act::ToggleTg);
-            }
-            let on = matches!(self.t_run, Run::On);
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                if ui::ghost_w(ui, "Открыть в Telegram", on, w, 38.0) {
-                    *act = Some(Act::OpenTelegram);
-                }
-                if ui::ghost_w(ui, "Скопировать ссылку", on, w, 38.0) {
-                    *act = Some(Act::CopyLink);
-                }
+                let (text, color) = self.status_of(self.z_run, ready);
+                ui.label(ui::bold(text, 21.0, color));
+                ui.label(ui::muted(c, self.s.mode.label()));
+                ui.add_space(6.0);
             });
         });
-    }
 
-    /// Меню ••• рядом с «Запретом»: сервисы, стратегия, обновление.
-    fn dots_menu(&self, ui: &mut Ui, act: &mut Option<Act>) {
-        ui.scope(|ui| {
-            {
-                let w = &mut ui.visuals_mut().widgets;
-                w.inactive.weak_bg_fill = Color32::TRANSPARENT;
-                w.inactive.bg_fill = Color32::TRANSPARENT;
+        ui::card(ui, c, |ui| {
+            ui.label(ui::bold("Сервисы", 16.0, c.text));
+            ui.label(
+                RichText::new("Что нужно разблокировать")
+                    .size(13.0)
+                    .color(c.muted),
+            );
+            ui.add_space(4.0);
+            let w = ui.available_width();
+            if let Some(i) = ui::segmented(
+                ui,
+                c,
+                Id::new("seg_mode"),
+                &["YouTube и Discord", "Только YouTube", "Только Discord"],
+                self.s.mode.index(),
+                w,
+            ) {
+                *act = Some(Act::SetMode(Mode::from_index(i)));
             }
-            ui.menu_button(
-                RichText::new("•••").size(16.0).color(ui::MUTED),
+        });
+
+        ui::card(ui, c, |ui| {
+            ui::row(
+                ui,
+                c,
+                "Стратегия",
+                "Если что-то не открывается, попробуй другую",
                 |ui| {
-                    ui.set_min_width(230.0);
-                    ui.label(ui::muted("Сервисы").size(12.0));
-                    for m in [Mode::Both, Mode::Youtube, Mode::Discord] {
-                        if ui.selectable_label(self.s.mode == m, m.label()).clicked() {
-                            *act = Some(Act::SetMode(m));
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    ui.menu_button("Стратегия", |ui| {
+                    let current = self.s.strategy.trim_end_matches(".bat").to_string();
+                    ui.menu_button(ui::bold(&current, 14.0, c.accent_fg), |ui| {
                         ui.set_min_width(200.0);
                         if self.strategies.is_empty() {
-                            ui.label(ui::muted("Список появится после загрузки"));
+                            ui.label(ui::muted(c, "Список появится после загрузки"));
                         }
                         for st in &self.strategies {
                             let title = st.trim_end_matches(".bat");
@@ -608,32 +655,157 @@ impl App {
                             }
                         }
                     });
-                    ui.separator();
-                    if ui.button("Обновить движки").clicked() {
-                        *act = Some(Act::UpdateEngines);
-                        ui.close_menu();
-                    }
-                    if ui.button("Открыть папку с логами").clicked() {
-                        *act = Some(Act::OpenLogs);
-                        ui.close_menu();
-                    }
                 },
             );
         });
     }
-}
 
-fn status_of(run: Run, ready: bool) -> (&'static str, Color32) {
-    match run {
-        Run::On => ("РАБОТАЕТ", ui::ACCENT),
-        Run::Starting(_) => ("ЗАПУСК…", ui::WARN),
-        Run::Off => {
-            if ready {
-                ("ВЫКЛЮЧЕНО", ui::MUTED)
-            } else {
-                ("ЖДЁТ ДВИЖОК", ui::WARN)
-            }
-        }
+    fn page_tg(&self, ui: &mut Ui, act: &mut Option<Act>) {
+        let c = &self.c;
+        let ready = matches!(self.engines, Engines::Ready);
+        ui::header(ui, c, "TG-прокси", "Для Telegram Desktop");
+
+        ui::card(ui, c, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(6.0);
+                if ui::power_button(ui, c, Id::new("power_tg"), self.t_run.code(), ready) {
+                    *act = Some(Act::ToggleTg);
+                }
+                let (text, color) = self.status_of(self.t_run, ready);
+                ui.label(ui::bold(text, 21.0, color));
+                ui.label(ui::muted(
+                    c,
+                    &format!("{}:{}", tgproxy::HOST, tgproxy::PORT),
+                ));
+                ui.add_space(6.0);
+            });
+        });
+
+        ui::card(ui, c, |ui| {
+            ui.label(ui::bold("Подключение", 16.0, c.text));
+            ui.label(
+                RichText::new(
+                    "Когда прокси работает, нажми «Открыть в Telegram»: приложение предложит добавить прокси.",
+                )
+                .size(13.0)
+                .color(c.muted),
+            );
+            ui.add_space(4.0);
+            let on = matches!(self.t_run, Run::On);
+            let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            ui.horizontal(|ui| {
+                if ui::button(ui, c, "Открыть в Telegram", true, on, w, 44.0) {
+                    *act = Some(Act::OpenTelegram);
+                }
+                if ui::button(ui, c, "Скопировать ссылку", false, on, w, 44.0) {
+                    *act = Some(Act::CopyLink);
+                }
+            });
+        });
+    }
+
+    fn page_settings(&self, ui: &mut Ui, act: &mut Option<Act>) {
+        let c = &self.c;
+        ui::header(ui, c, "Настройки", "Запуск, оформление и движки");
+
+        ui::card(ui, c, |ui| {
+            ui.label(ui::bold("Запуск", 16.0, c.text));
+            ui::row(
+                ui,
+                c,
+                "Запускать вместе с Windows",
+                "Unblock откроется свёрнутым при входе в систему",
+                |ui| {
+                    if ui::switch(ui, c, Id::new("sw_autostart"), self.autostart) {
+                        *act = Some(Act::SetAutostart(!self.autostart));
+                    }
+                },
+            );
+            ui::divider(ui, c);
+            ui::row(
+                ui,
+                c,
+                "Включать при запуске",
+                "Запрет и TG-прокси включатся сами",
+                |ui| {
+                    if ui::switch(ui, c, Id::new("sw_auto_enable"), self.s.auto_enable) {
+                        *act = Some(Act::SetAutoEnable(!self.s.auto_enable));
+                    }
+                },
+            );
+        });
+
+        ui::card(ui, c, |ui| {
+            ui.label(ui::bold("Оформление", 16.0, c.text));
+            ui::row(
+                ui,
+                c,
+                "Тема",
+                "Тёмная или светлая",
+                |ui| {
+                    if let Some(i) = ui::segmented(
+                        ui,
+                        c,
+                        Id::new("seg_theme"),
+                        &["Тёмная", "Светлая"],
+                        if self.s.theme_dark { 0 } else { 1 },
+                        220.0,
+                    ) {
+                        *act = Some(Act::SetTheme(i == 0));
+                    }
+                },
+            );
+            ui::divider(ui, c);
+            ui::row(
+                ui,
+                c,
+                "Цвет акцента",
+                ui::ACCENTS[self.s.accent.min(4)].0,
+                |ui| {
+                    if let Some(i) = ui::swatches(ui, c, Id::new("accent"), self.s.accent) {
+                        *act = Some(Act::SetAccent(i));
+                    }
+                },
+            );
+        });
+
+        ui::card(ui, c, |ui| {
+            ui.label(ui::bold("Движки Flowseal", 16.0, c.text));
+            let dash = |s: &str| {
+                if s.is_empty() {
+                    "не скачан".to_string()
+                } else {
+                    s.to_string()
+                }
+            };
+            ui.label(ui::muted(
+                c,
+                &format!(
+                    "zapret: {}   ·   tg-ws-proxy: {}",
+                    dash(&self.s.zapret_tag),
+                    dash(&self.s.tg_tag)
+                ),
+            ));
+            ui.add_space(4.0);
+            let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            ui.horizontal(|ui| {
+                if ui::button(ui, c, "Обновить движки", false, true, w, 44.0) {
+                    *act = Some(Act::UpdateEngines);
+                }
+                if ui::button(ui, c, "Открыть папку с логами", false, true, w, 44.0)
+                {
+                    *act = Some(Act::OpenLogs);
+                }
+            });
+        });
+
+        ui.label(
+            RichText::new(
+                "Unblock управляет проектами Flowseal: zapret-discord-youtube и tg-ws-proxy. В основе запрета лежит zapret от bol-van.",
+            )
+            .size(12.0)
+            .color(c.muted),
+        );
     }
 }
 
@@ -644,31 +816,56 @@ impl eframe::App for App {
         }
         self.poll();
 
+        // «Включать при запуске»: ждём, пока движки готовы, и включаем один раз.
+        if self.pending_auto && matches!(self.engines, Engines::Ready) {
+            self.pending_auto = false;
+            if self.z_run.is_off() {
+                self.start_zapret();
+            }
+            if self.t_run.is_off() {
+                self.start_tg(ctx);
+            }
+        }
+
         let mut act: Option<Act> = None;
+        let c = self.c;
+
+        egui::SidePanel::left("sidebar")
+            .exact_width(236.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(c.surface)
+                    .stroke(egui::Stroke::new(1.0, c.line))
+                    .inner_margin(egui::Margin::symmetric(16.0, 18.0)),
+            )
+            .show(ctx, |ui| {
+                self.sidebar(ui, &mut act);
+            });
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(ui::BG)
-                    .inner_margin(egui::Margin::symmetric(24.0, 20.0)),
+                    .fill(c.bg)
+                    .inner_margin(egui::Margin::symmetric(28.0, 24.0)),
             )
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 14.0;
-                self.view(ui, &mut act);
+                self.page(ui, &mut act);
             });
 
         if let Some((text, _)) = &self.toast {
-            egui::Area::new(egui::Id::new("toast"))
+            egui::Area::new(Id::new("toast"))
                 .order(egui::Order::Foreground)
-                .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -16.0))
+                .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-20.0, -20.0))
                 .show(ctx, |ui| {
                     egui::Frame::none()
-                        .fill(ui::SURFACE2)
-                        .stroke(egui::Stroke::new(1.0, ui::LINE))
+                        .fill(c.surface2)
+                        .stroke(egui::Stroke::new(1.0, c.line))
                         .rounding(18.0)
                         .inner_margin(egui::Margin::symmetric(18.0, 12.0))
                         .show(ui, |ui| {
-                            ui.set_max_width(540.0);
-                            ui.label(RichText::new(text.as_str()).color(ui::TEXT));
+                            ui.set_max_width(420.0);
+                            ui.label(RichText::new(text.as_str()).color(c.text));
                         });
                 });
         }

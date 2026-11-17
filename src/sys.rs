@@ -64,6 +64,50 @@ pub fn is_admin() -> bool {
     }
 }
 
+const TASK_NAME: &str = "Unblock";
+
+/// Есть ли задача автозапуска. Задача планировщика запускает приложение сразу
+/// с правами администратора, поэтому Windows не спрашивает подтверждение при каждом входе.
+pub fn autostart_enabled() -> bool {
+    hidden("schtasks")
+        .args(["/Query", "/TN", TASK_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn set_autostart(on: bool) -> Result<(), String> {
+    let ok = if on {
+        let exe = std::env::current_exe().map_err(|e| format!("Не нашёл путь к программе: {e}"))?;
+        let cmd = format!("\"{}\" --autostart", exe.display());
+        hidden("schtasks")
+            .args([
+                "/Create",
+                "/TN",
+                TASK_NAME,
+                "/TR",
+                cmd.as_str(),
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+                "/F",
+            ])
+            .status()
+    } else {
+        hidden("schtasks")
+            .args(["/Delete", "/TN", TASK_NAME, "/F"])
+            .status()
+    }
+    .map(|s| s.success())
+    .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err("Не удалось изменить автозапуск (нужны права администратора).".to_string())
+    }
+}
+
 pub fn valid_secret(s: &str) -> bool {
     s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
