@@ -1,0 +1,25 @@
+[package]
+name = "unblock"
+version = "0.1.0"
+edition = "2021"
+description = "Минималистичное окно для запуска обхода блокировок: zapret и TG WS Proxy от Flowseal"
+license = "MIT"
+
+[dependencies]
+# Версия egui закреплена: так сборка не ломается от обновлений библиотеки.
+eframe = { version = "=0.29.1", default-features = false, features = ["default_fonts", "glow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.10", features = ["json"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+embed-resource = "2.5"
+
+# Маленький и быстрый exe.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
