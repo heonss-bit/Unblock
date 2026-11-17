@@ -1,0 +1,37 @@
+name: Build
+'on':
+  push:
+    branches:
+    - main
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Run tests
+      run: cargo test --release
+    - name: Build
+      run: cargo build --release
+    - name: Pack files
+      shell: pwsh
+      run: |
+        Copy-Item target/release/unblock.exe Unblock.exe
+        $hash = (Get-FileHash Unblock.exe -Algorithm SHA256).Hash.ToLower()
+        "$hash  Unblock.exe" | Out-File -FilePath Unblock.exe.sha256 -Encoding ascii
+        Write-Host ("Unblock.exe: {0:N1} MB, sha256 {1}" -f ((Get-Item Unblock.exe).Length / 1MB), $hash)
+    - uses: actions/upload-artifact@v4
+      with:
+        name: windows
+        path: |
+          Unblock.exe
+          Unblock.exe.sha256
+    - name: Publish release
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release create v0.1.${{ github.run_number }} Unblock.exe Unblock.exe.sha256 --title "Unblock BETA v0.1.${{ github.run_number }}" --notes-file RELEASE_NOTES.md
