@@ -579,6 +579,13 @@ impl App {
         });
     }
 
+    fn restart_zapret_if_running(&mut self) {
+        if !self.z_run.is_off() {
+            self.stop_zapret();
+            self.start_zapret();
+        }
+    }
+
     fn scanning(&self) -> bool {
         matches!(self.scan, Scan::Running { .. })
     }
