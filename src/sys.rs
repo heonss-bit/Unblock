@@ -108,6 +108,77 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+mod win {
+    type Hwnd = isize;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> i32, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(h: Hwnd, pid: *mut u32) -> u32;
+        fn GetWindowTextW(h: Hwnd, buf: *mut u16, max: i32) -> i32;
+        fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
+        fn SetForegroundWindow(h: Hwnd) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    extern "system" fn each(h: Hwnd, lparam: isize) -> i32 {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, &mut pid) };
+        if pid == unsafe { GetCurrentProcessId() } {
+            let mut buf = [0u16; 64];
+            let n = unsafe { GetWindowTextW(h, buf.as_mut_ptr(), 64) };
+            if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "Unblock" {
+                unsafe { *(lparam as *mut isize) = h };
+                return 0; // нашли, перебор можно остановить
+            }
+        }
+        1
+    }
+
+    /// Главное окно этого процесса (по заголовку «Unblock»; окно проводника с таким же именем чужое).
+    fn main_window() -> Option<Hwnd> {
+        let mut found: isize = 0;
+        unsafe { EnumWindows(each, &mut found as *mut isize as isize) };
+        if found != 0 {
+            Some(found)
+        } else {
+            None
+        }
+    }
+
+    pub fn hide() {
+        if let Some(h) = main_window() {
+            unsafe { ShowWindow(h, 0) }; // SW_HIDE
+        }
+    }
+
+    pub fn show() {
+        if let Some(h) = main_window() {
+            unsafe {
+                ShowWindow(h, 5); // SW_SHOW
+                ShowWindow(h, 9); // SW_RESTORE (если было свёрнуто)
+                SetForegroundWindow(h);
+            }
+        }
+    }
+}
+
+/// Прячет главное окно (программа остаётся в трее).
+pub fn hide_main_window() {
+    #[cfg(windows)]
+    win::hide();
+}
+
+/// Показывает главное окно из трея.
+pub fn show_main_window() {
+    #[cfg(windows)]
+    win::show();
+}
+
 pub fn valid_secret(s: &str) -> bool {
     s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
 }

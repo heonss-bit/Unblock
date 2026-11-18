@@ -1,15 +1,18 @@
 //! Главное окно Unblock: слева колонка с разделами, справа страница выбранного раздела.
 
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Align2, Color32, Id, Layout, RichText, Ui, Vec2};
 
-use crate::settings::{Mode, Settings};
+use crate::bat::Services;
+use crate::settings::Settings;
 use crate::ui::{self, Colors};
-use crate::{engines, sys, tgproxy, zapret};
+use crate::{engines, scan, sys, tgproxy, tray, zapret};
 
 /// Сообщения из фоновых потоков в окно.
 enum Msg {
@@ -24,6 +27,22 @@ enum Msg {
     },
     InstallFailed(String),
     TgReady(bool),
+    ScanProgress {
+        done: usize,
+        total: usize,
+        name: String,
+    },
+    ScanDone(Vec<scan::Score>),
+}
+
+/// Подбор стратегии.
+enum Scan {
+    Idle,
+    Running {
+        done: usize,
+        total: usize,
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -71,8 +90,14 @@ enum Act {
     ToggleZapret,
     ToggleTg,
     ToggleAll,
-    SetMode(Mode),
     SetStrategy(String),
+    /// Выбрать стратегию и сразу включить запрет.
+    UseStrategy(String),
+    StartScan,
+    StopScan,
+    InstallTg,
+    TgPromptLater,
+    SetCloseToTray(bool),
     UpdateEngines,
     Retry,
     CopyLink,
@@ -99,6 +124,16 @@ pub struct App {
     /// Запуск из автозапуска Windows: в первом кадре сворачиваем окно.
     start_minimized: bool,
     strategies: Vec<String>,
+    scan: Scan,
+    scores: Vec<scan::Score>,
+    best: Option<String>,
+    cancel: Arc<AtomicBool>,
+    tg_installed: bool,
+    /// Пользователь просил поставить TG-прокси (нужно для «Повторить»).
+    tg_want: bool,
+    tray_ok: bool,
+    /// Сколько первых кадров прятать окно в трей (запуск из автозапуска).
+    hide_frames: u8,
     toast: Option<(String, Instant)>,
     down: bool,
     tx: Sender<Msg>,
@@ -116,6 +151,13 @@ impl App {
         ui::install_fonts(&cc.egui_ctx);
         ui::apply(&cc.egui_ctx, &c);
 
+        let tg_installed = engines::tg_installed();
+        if tg_installed && !s.tg_prompt_done {
+            // Обновление с прошлой версии: TG-прокси уже стоит, вопрос не нужен.
+            s.tg_prompt_done = true;
+            s.save();
+        }
+        let tray_ok = tray::init(&cc.egui_ctx);
         let (tx, rx) = channel();
         let pending_auto = s.auto_enable;
         let mut app = App {
@@ -132,14 +174,22 @@ impl App {
             pending_auto,
             start_minimized: std::env::args().any(|a| a == "--autostart"),
             strategies: Vec::new(),
+            scan: Scan::Idle,
+            scores: Vec::new(),
+            best: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            tg_installed,
+            tg_want: false,
+            tray_ok,
+            hide_frames: 0,
             toast: None,
             down: false,
             tx,
             rx,
         };
         app.refresh_strategies();
-        // Первый запуск: движков ещё нет, скачиваем их с GitHub Flowseal.
-        app.spawn_install(&cc.egui_ctx, false);
+        // Первый запуск: скачиваем только запрет. TG-прокси ставится по желанию.
+        app.spawn_install(&cc.egui_ctx, !engines::zapret_installed(), false);
         app
     }
 
@@ -158,9 +208,7 @@ impl App {
         }
     }
 
-    fn spawn_install(&mut self, ctx: &egui::Context, force: bool) {
-        let need_zapret = force || !engines::zapret_installed();
-        let need_tg = force || !engines::tg_installed();
+    fn spawn_install(&mut self, ctx: &egui::Context, need_zapret: bool, need_tg: bool) {
         if !need_zapret && !need_tg {
             self.engines = Engines::Ready;
             return;
@@ -221,6 +269,10 @@ impl App {
     // ------------------------------------------------------------ запрет
 
     fn start_zapret(&mut self) {
+        if self.scanning() {
+            self.toast("Идёт подбор стратегии, подожди немного.");
+            return;
+        }
         if !self.admin {
             self.toast(
                 "Нужны права администратора: закрой Unblock и запусти его от имени администратора.",
@@ -231,7 +283,7 @@ impl App {
             self.toast("Движок запрета ещё не скачан.");
             return;
         };
-        match zapret::start(&root, &self.s.strategy, self.s.mode.services()) {
+        match zapret::start(&root, &self.s.strategy, Services::Both) {
             Ok(child) => {
                 self.z = Some(child);
                 self.z_run = Run::Starting(Instant::now());
@@ -283,10 +335,12 @@ impl App {
             return;
         }
         self.down = true;
-        let had_zapret = self.z.is_some();
+        let had_zapret = self.z.is_some() || matches!(self.scan, Scan::Running { .. });
+        self.cancel.store(true, Ordering::SeqCst);
         self.stop_zapret();
         self.stop_tg();
         if had_zapret {
+            sys::kill_image("winws.exe");
             sys::stop_windivert();
         }
     }
@@ -294,6 +348,13 @@ impl App {
     // ------------------------------------------------------------ события
 
     fn poll(&mut self) {
+        // «Отключить» из меню трея: процессы уже остановлены, выравниваем переключатели.
+        if tray::take_disable() {
+            self.z = None;
+            self.t = None;
+            self.z_run = Run::Off;
+            self.t_run = Run::Off;
+        }
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Progress { label, done, total } => {
@@ -305,13 +366,30 @@ impl App {
                     }
                     if let Some(t) = tg {
                         self.s.tg_tag = t;
+                        self.tg_installed = true;
                     }
                     self.refresh_strategies();
                     self.s.save();
                     self.engines = Engines::Ready;
-                    self.toast("Движки Flowseal готовы");
+                    self.toast("Готово");
                 }
                 Msg::InstallFailed(e) => self.engines = Engines::Failed(e),
+                Msg::ScanProgress { done, total, name } => {
+                    self.scan = Scan::Running { done, total, name };
+                }
+                Msg::ScanDone(scores) => {
+                    self.scan = Scan::Idle;
+                    self.best = scan::best(&scores).map(|i| scores[i].name.clone());
+                    let n = scores.len();
+                    self.scores = scores;
+                    if self.cancel.load(Ordering::SeqCst) {
+                        self.toast("Подбор остановлен");
+                    } else if self.best.is_some() {
+                        self.toast("Готово: лучшая стратегия отмечена в списке");
+                    } else if n > 0 {
+                        self.toast("Ни одна стратегия не открыла сайты. Проверь интернет и права администратора.");
+                    }
+                }
                 Msg::TgReady(ok) => {
                     if matches!(self.t_run, Run::Starting(_)) {
                         if ok {
@@ -369,31 +447,48 @@ impl App {
                 }
             }
             Act::ToggleTg => {
-                if self.t_run.is_off() {
+                if !self.tg_installed {
+                    self.toast("Сначала скачай TG-прокси");
+                } else if self.t_run.is_off() {
                     self.start_tg(ctx);
                 } else {
                     self.stop_tg();
                 }
             }
             Act::ToggleAll => {
-                if !self.z_run.is_off() && !self.t_run.is_off() {
+                if !self.z_run.is_off() && (!self.t_run.is_off() || !self.tg_installed) {
                     self.stop_zapret();
                     self.stop_tg();
                 } else {
                     if self.z_run.is_off() {
                         self.start_zapret();
                     }
-                    if self.t_run.is_off() {
+                    if self.t_run.is_off() && self.tg_installed {
                         self.start_tg(ctx);
                     }
                 }
             }
-            Act::SetMode(m) => {
-                if self.s.mode != m {
-                    self.s.mode = m;
-                    self.s.save();
-                    self.restart_zapret_if_running();
-                }
+            Act::StartScan => self.start_scan(ctx),
+            Act::StopScan => self.cancel.store(true, Ordering::SeqCst),
+            Act::UseStrategy(name) => {
+                self.s.strategy = name;
+                self.s.save();
+                self.stop_zapret();
+                self.start_zapret();
+            }
+            Act::InstallTg => {
+                self.s.tg_prompt_done = true;
+                self.s.save();
+                self.tg_want = true;
+                self.spawn_install(ctx, false, true);
+            }
+            Act::TgPromptLater => {
+                self.s.tg_prompt_done = true;
+                self.s.save();
+            }
+            Act::SetCloseToTray(on) => {
+                self.s.close_to_tray = on;
+                self.s.save();
             }
             Act::SetStrategy(name) => {
                 if self.s.strategy != name {
@@ -406,9 +501,13 @@ impl App {
                 self.stop_zapret();
                 self.stop_tg();
                 sys::stop_windivert();
-                self.spawn_install(ctx, true);
+                let tg = self.tg_installed;
+                self.spawn_install(ctx, true, tg);
             }
-            Act::Retry => self.spawn_install(ctx, false),
+            Act::Retry => {
+                let tg = self.tg_want && !self.tg_installed;
+                self.spawn_install(ctx, !engines::zapret_installed(), tg);
+            }
             Act::CopyLink => {
                 ctx.copy_text(tgproxy::link(&self.s.secret));
                 self.toast("Ссылка скопирована");
@@ -438,11 +537,50 @@ impl App {
         }
     }
 
-    fn restart_zapret_if_running(&mut self) {
-        if !self.z_run.is_off() {
-            self.stop_zapret();
-            self.start_zapret();
+    fn start_scan(&mut self, ctx: &egui::Context) {
+        if !self.admin {
+            self.toast(
+                "Для подбора нужны права администратора: запусти Unblock от имени администратора.",
+            );
+            return;
         }
+        let Some(root) = engines::zapret_root() else {
+            self.toast("Движок запрета ещё не скачан.");
+            return;
+        };
+        if self.strategies.is_empty() {
+            return;
+        }
+        self.stop_zapret();
+        self.scores.clear();
+        self.best = None;
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.scan = Scan::Running {
+            done: 0,
+            total: self.strategies.len(),
+            name: String::new(),
+        };
+        let names = self.strategies.clone();
+        let cancel = self.cancel.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut progress = |done: usize, total: usize, name: &str| {
+                let _ = tx.send(Msg::ScanProgress {
+                    done,
+                    total,
+                    name: name.to_string(),
+                });
+                ctx.request_repaint();
+            };
+            let scores = scan::run(&root, &names, &cancel, &mut progress);
+            let _ = tx.send(Msg::ScanDone(scores));
+            ctx.request_repaint();
+        });
+    }
+
+    fn scanning(&self) -> bool {
+        matches!(self.scan, Scan::Running { .. })
     }
 
     // ------------------------------------------------------------ боковая колонка
@@ -503,13 +641,23 @@ impl App {
                     .color(c.muted),
             );
             let ready = matches!(self.engines, Engines::Ready);
-            let both_active = !self.z_run.is_off() && !self.t_run.is_off();
+            let both_active = !self.z_run.is_off() && (!self.t_run.is_off() || !self.tg_installed);
+            let on_label = if self.tg_installed {
+                "Включить всё"
+            } else {
+                "Включить запрет"
+            };
             let w = ui.available_width();
             if both_active {
-                if ui::button(ui, c, "Выключить всё", false, true, w, 46.0) {
+                let off_label = if self.tg_installed {
+                    "Выключить всё"
+                } else {
+                    "Выключить запрет"
+                };
+                if ui::button(ui, c, off_label, false, true, w, 46.0) {
                     *act = Some(Act::ToggleAll);
                 }
-            } else if ui::button(ui, c, "Включить всё", true, ready, w, 46.0) {
+            } else if ui::button(ui, c, on_label, true, ready, w, 46.0) {
                 *act = Some(Act::ToggleAll);
             }
         });
@@ -543,10 +691,29 @@ impl App {
                 ));
             });
         }
+        if !self.s.tg_prompt_done && !self.tg_installed {
+            ui::card(ui, c, |ui| {
+                ui.label(ui::bold("Установить TG-прокси?", 16.0, c.text));
+                ui.label(ui::muted(
+                    c,
+                    "В любой момент вы можете его скачать во вкладке «TG-прокси».",
+                ));
+                ui.add_space(4.0);
+                let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                ui.horizontal(|ui| {
+                    if ui::button(ui, c, "Установить", true, true, w, 44.0) {
+                        *act = Some(Act::InstallTg);
+                    }
+                    if ui::button(ui, c, "Не сейчас", false, true, w, 44.0) {
+                        *act = Some(Act::TgPromptLater);
+                    }
+                });
+            });
+        }
         match &self.engines {
             Engines::Installing { label, done, total } => {
                 ui::card(ui, c, |ui| {
-                    ui.label(ui::bold("Скачиваю движки Flowseal", 16.0, c.text));
+                    ui.label(ui::bold("Скачиваю с GitHub Flowseal", 16.0, c.text));
                     let mb = |b: u64| b as f64 / 1_048_576.0;
                     let line = if *total > 0 {
                         format!("{label}: {:.1} из {:.1} МБ", mb(*done), mb(*total))
@@ -598,68 +765,138 @@ impl App {
         }
     }
 
+    /// Строки списка стратегий: сначала проверенные (лучшая первой), потом остальные.
+    fn ordered_strategies(&self) -> Vec<&String> {
+        let mut out: Vec<&String> = Vec::new();
+        if !self.scores.is_empty() {
+            let mut sc: Vec<&scan::Score> = self.scores.iter().collect();
+            sc.sort_by_key(|x| {
+                (
+                    self.best.as_deref() != Some(x.name.as_str()),
+                    u8::MAX - x.ok,
+                    x.ms,
+                )
+            });
+            for x in sc {
+                if let Some(n) = self.strategies.iter().find(|n| **n == x.name) {
+                    out.push(n);
+                }
+            }
+        }
+        for n in &self.strategies {
+            if !out.iter().any(|o| *o == n) {
+                out.push(n);
+            }
+        }
+        out
+    }
+
     fn page_zapret(&self, ui: &mut Ui, act: &mut Option<Act>) {
         let c = &self.c;
         let ready = matches!(self.engines, Engines::Ready);
+        let scanning = self.scanning();
         ui::header(ui, c, "Запрет", "Открывает YouTube и Discord");
 
         ui::card(ui, c, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(6.0);
-                if ui::power_button(ui, c, Id::new("power_zapret"), self.z_run.code(), ready) {
+                if ui::power_button(
+                    ui,
+                    c,
+                    Id::new("power_zapret"),
+                    self.z_run.code(),
+                    ready && !scanning,
+                ) {
                     *act = Some(Act::ToggleZapret);
                 }
                 let (text, color) = self.status_of(self.z_run, ready);
                 ui.label(ui::bold(text, 21.0, color));
-                ui.label(ui::muted(c, self.s.mode.label()));
+                ui::pill(ui, c, "YouTube · Discord", c.accent_fg);
                 ui.add_space(6.0);
             });
         });
 
         ui::card(ui, c, |ui| {
-            ui.label(ui::bold("Сервисы", 16.0, c.text));
-            ui.label(
-                RichText::new("Что нужно разблокировать")
-                    .size(13.0)
-                    .color(c.muted),
-            );
-            ui.add_space(4.0);
-            let w = ui.available_width();
-            if let Some(i) = ui::segmented(
-                ui,
-                c,
-                Id::new("seg_mode"),
-                &["YouTube и Discord", "Только YouTube", "Только Discord"],
-                self.s.mode.index(),
-                w,
-            ) {
-                *act = Some(Act::SetMode(Mode::from_index(i)));
-            }
-        });
+            let subtitle = match &self.scan {
+                Scan::Running { done, total, name } => {
+                    format!(
+                        "Проверяю {done} из {total}: {}",
+                        name.trim_end_matches(".bat")
+                    )
+                }
+                Scan::Idle => match &self.best {
+                    Some(b) => format!("Лучшая по проверке: {}", b.trim_end_matches(".bat")),
+                    None => "Если что-то не открывается, подбери другую".to_string(),
+                },
+            };
+            ui::row(ui, c, "Стратегия", &subtitle, |ui| {
+                if scanning {
+                    if ui::button(ui, c, "Остановить", false, true, 190.0, 42.0) {
+                        *act = Some(Act::StopScan);
+                    }
+                } else if ui::button(
+                    ui,
+                    c,
+                    "Подобрать стратегию",
+                    true,
+                    ready && !self.strategies.is_empty(),
+                    190.0,
+                    42.0,
+                ) {
+                    *act = Some(Act::StartScan);
+                }
+            });
 
-        ui::card(ui, c, |ui| {
-            ui::row(
-                ui,
-                c,
-                "Стратегия",
-                "Если что-то не открывается, попробуй другую",
-                |ui| {
-                    let current = self.s.strategy.trim_end_matches(".bat").to_string();
-                    ui.menu_button(ui::bold(&current, 14.0, c.accent_fg), |ui| {
-                        ui.set_min_width(200.0);
-                        if self.strategies.is_empty() {
-                            ui.label(ui::muted(c, "Список появится после загрузки"));
-                        }
-                        for st in &self.strategies {
-                            let title = st.trim_end_matches(".bat");
-                            if ui.selectable_label(self.s.strategy == *st, title).clicked() {
-                                *act = Some(Act::SetStrategy(st.clone()));
-                                ui.close_menu();
+            if let Scan::Running { done, total, .. } = &self.scan {
+                let frac = if *total > 0 {
+                    (*done as f32 - 0.5).max(0.0) / *total as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .fill(c.accent)
+                        .desired_height(6.0),
+                );
+            }
+
+            ui.add_space(2.0);
+            if self.strategies.is_empty() {
+                ui.label(ui::muted(c, "Список появится после загрузки запрета"));
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        for (i, st) in self.ordered_strategies().into_iter().enumerate() {
+                            let result = self
+                                .scores
+                                .iter()
+                                .find(|x| x.name == *st)
+                                .map(|x| (x.ok, x.total));
+                            let is_best = self.best.as_deref() == Some(st.as_str());
+                            let click = ui::strategy_row(
+                                ui,
+                                c,
+                                Id::new(("strategy", i)),
+                                st.trim_end_matches(".bat"),
+                                self.s.strategy == *st,
+                                result,
+                                is_best,
+                            );
+                            match click {
+                                ui::RowClick::Select if !scanning => {
+                                    *act = Some(Act::SetStrategy(st.clone()));
+                                }
+                                ui::RowClick::Use if !scanning => {
+                                    *act = Some(Act::UseStrategy(st.clone()));
+                                }
+                                _ => {}
                             }
                         }
                     });
-                },
-            );
+            }
         });
     }
 
@@ -667,6 +904,24 @@ impl App {
         let c = &self.c;
         let ready = matches!(self.engines, Engines::Ready);
         ui::header(ui, c, "TG-прокси", "Для Telegram Desktop");
+
+        if !self.tg_installed {
+            let busy = matches!(self.engines, Engines::Installing { .. });
+            ui::card(ui, c, |ui| {
+                ui::pill(ui, c, "НЕ УСТАНОВЛЕН", c.warn);
+                ui.label(ui::bold("Нужно скачать TG-прокси", 18.0, c.text));
+                ui.label(ui::muted(
+                    c,
+                    "Это официальная программа Flowseal (tg-ws-proxy). Она скачается один раз с GitHub.",
+                ));
+                ui.add_space(4.0);
+                let w = ui.available_width();
+                if ui::button(ui, c, "Скачать TG-прокси", true, !busy, w, 46.0) {
+                    *act = Some(Act::InstallTg);
+                }
+            });
+            return;
+        }
 
         ui::card(ui, c, |ui| {
             ui.vertical_centered(|ui| {
@@ -733,6 +988,21 @@ impl App {
                 |ui| {
                     if ui::switch(ui, c, Id::new("sw_auto_enable"), self.s.auto_enable) {
                         *act = Some(Act::SetAutoEnable(!self.s.auto_enable));
+                    }
+                },
+            );
+        });
+
+        ui::card(ui, c, |ui| {
+            ui.label(ui::bold("Окно", 16.0, c.text));
+            ui::row(
+                ui,
+                c,
+                "Сворачивать в трей при закрытии",
+                "Крестик прячет окно, обход продолжает работать",
+                |ui| {
+                    if ui::switch(ui, c, Id::new("sw_tray"), self.s.close_to_tray) {
+                        *act = Some(Act::SetCloseToTray(!self.s.close_to_tray));
                     }
                 },
             );
@@ -815,11 +1085,27 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.shutdown();
+            if self.s.close_to_tray && self.tray_ok {
+                // Крестик: окно прячем, программа остаётся в трее.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                sys::hide_main_window();
+            } else {
+                self.shutdown();
+            }
         }
         if self.start_minimized {
             self.start_minimized = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if self.s.close_to_tray && self.tray_ok {
+                self.hide_frames = 4;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        }
+        if self.hide_frames > 0 {
+            // eframe показывает окно после первого кадра, поэтому прячем несколько кадров подряд.
+            self.hide_frames -= 1;
+            sys::hide_main_window();
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
         self.poll();
 
@@ -885,7 +1171,8 @@ impl eframe::App for App {
         // Пока что-то запускается или работает, изредка просыпаемся и проверяем процессы.
         let busy = matches!(self.engines, Engines::Installing { .. })
             || matches!(self.z_run, Run::Starting(_))
-            || matches!(self.t_run, Run::Starting(_));
+            || matches!(self.t_run, Run::Starting(_))
+            || self.scanning();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(250));
         } else if self.z.is_some() || self.t.is_some() || self.toast.is_some() {

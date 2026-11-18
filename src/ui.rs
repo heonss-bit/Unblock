@@ -390,6 +390,131 @@ pub fn swatches(ui: &mut Ui, c: &Colors, id: Id, selected: usize) -> Option<usiz
     clicked
 }
 
+/// Что сделали со строкой стратегии.
+pub enum RowClick {
+    None,
+    Select,
+    Use,
+}
+
+/// Строка списка стратегий: точка выбора, название, результат проверки.
+/// У лучшей стратегии справа ещё метка «ЛУЧШАЯ» и кнопка «Использовать?».
+pub fn strategy_row(
+    ui: &mut Ui,
+    c: &Colors,
+    id: Id,
+    name: &str,
+    selected: bool,
+    result: Option<(u8, u8)>,
+    best: bool,
+) -> RowClick {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::click());
+    let ctx = ui.ctx().clone();
+    let sel_t = ctx.animate_bool_with_time(id.with("sel"), selected, 0.18);
+    let hov_t = ctx.animate_bool_with_time(id.with("hov"), resp.hovered(), 0.12);
+    let p = ui.painter().clone();
+
+    p.rect_filled(
+        rect,
+        14.0,
+        tint(c.text, alpha_f(hov_t * (1.0 - sel_t), 12.0)),
+    );
+    p.rect_filled(rect, 14.0, tint(c.accent, alpha_f(sel_t, 30.0)));
+
+    // Точка выбора.
+    let dot = Pos2::new(rect.left() + 24.0, rect.center().y);
+    p.circle_stroke(
+        dot,
+        8.0,
+        Stroke::new(
+            1.6,
+            c.line
+                .lerp_to_gamma(c.accent_fg, sel_t)
+                .lerp_to_gamma(c.muted, (1.0 - sel_t) * 0.5),
+        ),
+    );
+    if sel_t > 0.0 {
+        p.circle_filled(dot, 4.5 * sel_t, c.accent);
+    }
+
+    p.text(
+        Pos2::new(rect.left() + 46.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        bold_font(15.0),
+        c.muted
+            .lerp_to_gamma(c.text, (sel_t + hov_t * 0.6).min(1.0)),
+    );
+
+    // Правая часть собирается справа налево.
+    let mut x = rect.right() - 12.0;
+    let mut used = false;
+    if best && !selected {
+        let br = Rect::from_min_size(
+            Pos2::new(x - 112.0, rect.top() + 8.0),
+            Vec2::new(112.0, 30.0),
+        );
+        let r2 = ui.interact(br, id.with("use"), Sense::click());
+        let h = ctx.animate_bool_with_time(id.with("use_h"), r2.hovered(), 0.15);
+        p.rect_filled(br, 12.0, c.accent.lerp_to_gamma(Color32::WHITE, 0.14 * h));
+        p.text(
+            br.center(),
+            Align2::CENTER_CENTER,
+            "Использовать?",
+            bold_font(13.0),
+            c.on_accent,
+        );
+        if r2.hovered() {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        used = r2.clicked();
+        x -= 120.0;
+    }
+    if best {
+        let pr = Rect::from_min_size(
+            Pos2::new(x - 72.0, rect.center().y - 11.0),
+            Vec2::new(72.0, 22.0),
+        );
+        p.rect_filled(pr, 11.0, tint(c.accent, 40));
+        p.text(
+            pr.center(),
+            Align2::CENTER_CENTER,
+            "ЛУЧШАЯ",
+            bold_font(11.0),
+            c.accent_fg,
+        );
+        x -= 80.0;
+    }
+    if let Some((ok, total)) = result {
+        let col = if ok == 0 {
+            c.junk
+        } else if ok >= total {
+            c.accent_fg
+        } else {
+            c.warn
+        };
+        p.text(
+            Pos2::new(x, rect.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{ok}/{total}"),
+            bold_font(14.0),
+            col,
+        );
+    }
+
+    if resp.hovered() {
+        ctx.set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if used {
+        RowClick::Use
+    } else if resp.clicked() {
+        RowClick::Select
+    } else {
+        RowClick::None
+    }
+}
+
 /// Большая круглая кнопка питания со свечением.
 /// `run`: 0 выключено, 1 запускается, 2 работает.
 pub fn power_button(ui: &mut Ui, c: &Colors, id: Id, run: u8, enabled: bool) -> bool {

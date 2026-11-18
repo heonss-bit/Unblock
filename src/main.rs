@@ -4,9 +4,11 @@
 mod app;
 mod bat;
 mod engines;
+mod scan;
 mod settings;
 mod sys;
 mod tgproxy;
+mod tray;
 mod ui;
 mod zapret;
 
